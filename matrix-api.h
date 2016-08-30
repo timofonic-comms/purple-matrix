@@ -165,6 +165,8 @@ MatrixApiRequestData *matrix_api_sync(MatrixConnectionData *conn,
  * @param event_type       The type of event (eg "m.room.message")
  * @param txn_id           Unique transaction id
  * @param content          The content of the event
+ * @param extra_data       Binary content to be appended
+ * @param extra_size       The size of the binary content
  * @param callback         Function to be called when the request completes
  * @param error_callback   Function to be called if there is an error making
  *                             the request. If NULL, matrix_api_error will be

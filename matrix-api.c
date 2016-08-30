@@ -393,7 +393,8 @@ static void _parse_url(const gchar *url, const gchar **host, const gchar **path)
  *  @returns a gchar* which should be freed
  */
 static gchar *_build_request(PurpleAccount *acct, const gchar *url,
-        const gchar *method, const gchar *body)
+        const gchar *method, const gchar *body,
+        const gchar *extra_data, gsize extra_len, gsize* total_len)
 {
     PurpleProxyInfo *gpi = purple_proxy_get_setup(acct);
     GString *request_str = g_string_new(NULL);
@@ -422,7 +423,7 @@ static gchar *_build_request(PurpleAccount *acct, const gchar *url,
 
     g_string_append(request_str, "Connection: close\r\n");
     g_string_append_printf(request_str, "Content-Length: %" G_GSIZE_FORMAT "\r\n",
-            body == NULL ? 0 : strlen(body));
+            extra_len + (body == NULL ? 0 : strlen(body)));
 
     if(using_http_proxy)
         _add_proxy_auth_headers(request_str, gpi);
@@ -431,6 +432,10 @@ static gchar *_build_request(PurpleAccount *acct, const gchar *url,
     if(body != NULL)
         g_string_append(request_str, body);
 
+    if(extra_data != NULL)
+        g_string_append_len(request_str, extra_data, extra_len);
+
+    *total_len = request_str->len; /* TODO: Surely there must be a function!? */
     return g_string_free(request_str, FALSE);
 }
 
@@ -438,17 +443,21 @@ static gchar *_build_request(PurpleAccount *acct, const gchar *url,
 /**
  * Start an HTTP call to the API
  *
- * @param method  HTTP method (eg "GET")
- * @param body    body of request, or NULL if none
- * @param max_len maximum number of bytes to return from the request. -1 for
- *                default (512K).
+ * @param method      HTTP method (eg "GET")
+ * @param body        body of request, or NULL if none
+ * @param extra_data  raw binary data to be sent after the body
+ * @param extra_len   The length of the raw binary data
+ * @param max_len     maximum number of bytes to return from the request. -1 for
+ *                    default (512K).
  *
  * @returns handle for the request, or NULL if the request couldn't be started
  *   (eg, invalid hostname). In this case, the error_callback will have
  *   been called already.
  */
 static MatrixApiRequestData *matrix_api_start(const gchar *url,
-        const gchar *method, const gchar *body, MatrixConnectionData *conn,
+        const gchar *method, const gchar *body,
+        const gchar *extra_data, gsize extra_len,
+        MatrixConnectionData *conn,
         MatrixApiCallback callback, MatrixApiErrorCallback error_callback,
         MatrixApiBadResponseCallback bad_response_callback,
         gpointer user_data, gssize max_len)
@@ -456,6 +465,7 @@ static MatrixApiRequestData *matrix_api_start(const gchar *url,
     MatrixApiRequestData *data;
     gchar *request;
     PurpleUtilFetchUrlData *purple_data;
+    gsize request_len;
 
     if (error_callback == NULL)
         error_callback = matrix_api_error;
@@ -472,7 +482,8 @@ static MatrixApiRequestData *matrix_api_start(const gchar *url,
         return NULL;
     }
 
-    request = _build_request(conn->pc->account, url, method, body);
+    request = _build_request(conn->pc->account, url, method, body,
+                             extra_data, extra_len, &request_len);
 
     if(purple_debug_is_unsafe())
         purple_debug_info("matrixprpl", "request %s\n", request);
@@ -485,9 +496,10 @@ static MatrixApiRequestData *matrix_api_start(const gchar *url,
     data->bad_response_callback = bad_response_callback;
     data->user_data = user_data;
 
-    purple_data = purple_util_fetch_url_request_len_with_account(
+    purple_data = purple_util_fetch_url_request_data_len_with_account(
             conn -> pc -> account,
-            url, FALSE, NULL, TRUE, request, TRUE, max_len, matrix_api_complete,
+            url, FALSE, NULL, TRUE, request, request_len,
+            TRUE, max_len, matrix_api_complete,
             data);
 
     if(purple_data == NULL) {
@@ -557,7 +569,7 @@ MatrixApiRequestData *matrix_api_password_login(MatrixConnectionData *conn,
 
     json = _build_login_body(username, password);
 
-    fetch_data = matrix_api_start(url, "POST", json, conn, callback,
+    fetch_data = matrix_api_start(url, "POST", json, NULL, 0, conn, callback,
             NULL, NULL, user_data, 0);
     g_free(json);
     g_free(url);
@@ -593,8 +605,9 @@ MatrixApiRequestData *matrix_api_sync(MatrixConnectionData *conn,
     /* XXX: stream the response, so that we don't need to allocate so much
      * memory? But it's JSON
      */
-    fetch_data = matrix_api_start(url->str, "GET", NULL, conn, callback,
-            error_callback, bad_response_callback, user_data, 10*1024*1024);
+    fetch_data = matrix_api_start(url->str, "GET", NULL, NULL, 0, conn,
+            callback, error_callback, bad_response_callback, user_data,
+            10*1024*1024);
     g_string_free(url, TRUE);
     
     return fetch_data;
@@ -603,7 +616,8 @@ MatrixApiRequestData *matrix_api_sync(MatrixConnectionData *conn,
 
 MatrixApiRequestData *matrix_api_send(MatrixConnectionData *conn,
         const gchar *room_id, const gchar *event_type, const gchar *txn_id,
-        JsonObject *content, MatrixApiCallback callback,
+        JsonObject *content,
+        MatrixApiCallback callback,
         MatrixApiErrorCallback error_callback,
         MatrixApiBadResponseCallback bad_response_callback,
         gpointer user_data)
@@ -638,8 +652,8 @@ MatrixApiRequestData *matrix_api_send(MatrixConnectionData *conn,
 
     purple_debug_info("matrixprpl", "sending %s on %s\n", event_type, room_id);
 
-    fetch_data = matrix_api_start(url->str, "PUT", json, conn, callback,
-            error_callback, bad_response_callback,
+    fetch_data = matrix_api_start(url->str, "PUT", json, NULL, 0,
+            conn, callback, error_callback, bad_response_callback,
             user_data, 0);
     g_free(json);
     g_string_free(url, TRUE);
@@ -666,9 +680,8 @@ MatrixApiRequestData *matrix_api_join_room(MatrixConnectionData *conn,
 
     purple_debug_info("matrixprpl", "joining %s\n", room);
 
-    fetch_data = matrix_api_start(url->str, "POST", "{}", conn, callback,
-            error_callback, bad_response_callback,
-            user_data, 0);
+    fetch_data = matrix_api_start(url->str, "POST", "{}", NULL, 0, conn,
+            callback, error_callback, bad_response_callback, user_data, 0);
     g_string_free(url, TRUE);
 
     return fetch_data;
@@ -693,9 +706,8 @@ MatrixApiRequestData *matrix_api_leave_room(MatrixConnectionData *conn,
 
     purple_debug_info("matrixprpl", "leaving %s\n", room_id);
 
-    fetch_data = matrix_api_start(url->str, "POST", "{}", conn, callback,
-            error_callback, bad_response_callback,
-            user_data, 0);
+    fetch_data = matrix_api_start(url->str, "POST", "{}", NULL, 0, conn,
+            callback, error_callback, bad_response_callback, user_data, 0);
     g_string_free(url, TRUE);
 
     return fetch_data;
@@ -719,7 +731,7 @@ MatrixApiRequestData *matrix_api_get_room_state(MatrixConnectionData *conn,
 
     purple_debug_info("matrixprpl", "getting state for %s\n", room_id);
 
-    fetch_data = matrix_api_start(url->str, NULL, conn, callback,
+    fetch_data = matrix_api_start(url->str, NULL, NULL, NULL, conn, callback,
             NULL, NULL, user_data, 10*1024*1024);
     g_string_free(url, TRUE);
 
