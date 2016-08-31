@@ -25,7 +25,9 @@
 #include <glib.h>
 
 struct _JsonObject;
+struct _MatrixRoomEvent;
 
+typedef void (*EventSendHook)(void *conv, struct _MatrixRoomEvent *event);
 typedef struct _MatrixRoomEvent {
     /* for outgoing events, our made-up transaction id. NULL for incoming
      * events.
@@ -37,6 +39,14 @@ typedef struct _MatrixRoomEvent {
 
     gchar *event_type;
     struct _JsonObject *content;
+
+    /* Hook (& data) called when the event is unqueued; the hook should
+     * do the send itself.
+     * Useful where a file has to be uploaded before sending the event.
+     */
+    EventSendHook hook;
+
+    void *hook_data;
 } MatrixRoomEvent;
 
 

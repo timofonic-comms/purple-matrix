@@ -50,5 +50,6 @@ void matrix_event_free(MatrixRoomEvent *event)
     g_free(event->txn_id);
     g_free(event->sender);
     g_free(event->event_type);
+    g_free(event->hook_data);
     g_free(event);
 }
