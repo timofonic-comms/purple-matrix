@@ -393,7 +393,8 @@ static void _parse_url(const gchar *url, const gchar **host, const gchar **path)
  *  @returns a gchar* which should be freed
  */
 static gchar *_build_request(PurpleAccount *acct, const gchar *url,
-        const gchar *method, const gchar *body,
+        const gchar *method, const gchar *extra_headers,
+        const gchar *body,
         const gchar *extra_data, gsize extra_len, gsize* total_len)
 {
     PurpleProxyInfo *gpi = purple_proxy_get_setup(acct);
@@ -421,6 +422,7 @@ static gchar *_build_request(PurpleAccount *acct, const gchar *url,
     g_string_append_printf(request_str, "Host: %.*s\r\n",
             (int)(url_path-url_host), url_host);
 
+    g_string_append(request_str, extra_headers);
     g_string_append(request_str, "Connection: close\r\n");
     g_string_append_printf(request_str, "Content-Length: %" G_GSIZE_FORMAT "\r\n",
             extra_len + (body == NULL ? 0 : strlen(body)));
@@ -444,6 +446,7 @@ static gchar *_build_request(PurpleAccount *acct, const gchar *url,
  * Start an HTTP call to the API
  *
  * @param method      HTTP method (eg "GET")
+ * @param extra_headers  Extra HTTP headers to add
  * @param body        body of request, or NULL if none
  * @param extra_data  raw binary data to be sent after the body
  * @param extra_len   The length of the raw binary data
@@ -455,7 +458,8 @@ static gchar *_build_request(PurpleAccount *acct, const gchar *url,
  *   been called already.
  */
 static MatrixApiRequestData *matrix_api_start(const gchar *url,
-        const gchar *method, const gchar *body,
+        const gchar *method, const gchar *extra_headers,
+        const gchar *body,
         const gchar *extra_data, gsize extra_len,
         MatrixConnectionData *conn,
         MatrixApiCallback callback, MatrixApiErrorCallback error_callback,
@@ -482,8 +486,8 @@ static MatrixApiRequestData *matrix_api_start(const gchar *url,
         return NULL;
     }
 
-    request = _build_request(conn->pc->account, url, method, body,
-                             extra_data, extra_len, &request_len);
+    request = _build_request(conn->pc->account, url, method, extra_headers,
+                             body, extra_data, extra_len, &request_len);
 
     if(purple_debug_is_unsafe())
         purple_debug_info("matrixprpl", "request %s\n", request);
@@ -569,8 +573,8 @@ MatrixApiRequestData *matrix_api_password_login(MatrixConnectionData *conn,
 
     json = _build_login_body(username, password);
 
-    fetch_data = matrix_api_start(url, "POST", json, NULL, 0, conn, callback,
-            NULL, NULL, user_data, 0);
+    fetch_data = matrix_api_start(url, "POST", "", json, NULL, 0, conn,
+                                  callback, NULL, NULL, user_data, 0);
     g_free(json);
     g_free(url);
 
@@ -605,7 +609,7 @@ MatrixApiRequestData *matrix_api_sync(MatrixConnectionData *conn,
     /* XXX: stream the response, so that we don't need to allocate so much
      * memory? But it's JSON
      */
-    fetch_data = matrix_api_start(url->str, "GET", NULL, NULL, 0, conn,
+    fetch_data = matrix_api_start(url->str, "GET", "", NULL, NULL, 0, conn,
             callback, error_callback, bad_response_callback, user_data,
             10*1024*1024);
     g_string_free(url, TRUE);
@@ -652,7 +656,7 @@ MatrixApiRequestData *matrix_api_send(MatrixConnectionData *conn,
 
     purple_debug_info("matrixprpl", "sending %s on %s\n", event_type, room_id);
 
-    fetch_data = matrix_api_start(url->str, "PUT", json, NULL, 0,
+    fetch_data = matrix_api_start(url->str, "PUT", "", json, NULL, 0,
             conn, callback, error_callback, bad_response_callback,
             user_data, 0);
     g_free(json);
@@ -680,7 +684,7 @@ MatrixApiRequestData *matrix_api_join_room(MatrixConnectionData *conn,
 
     purple_debug_info("matrixprpl", "joining %s\n", room);
 
-    fetch_data = matrix_api_start(url->str, "POST", "{}", NULL, 0, conn,
+    fetch_data = matrix_api_start(url->str, "POST", "", "{}", NULL, 0, conn,
             callback, error_callback, bad_response_callback, user_data, 0);
     g_string_free(url, TRUE);
 
@@ -706,7 +710,7 @@ MatrixApiRequestData *matrix_api_leave_room(MatrixConnectionData *conn,
 
     purple_debug_info("matrixprpl", "leaving %s\n", room_id);
 
-    fetch_data = matrix_api_start(url->str, "POST", "{}", NULL, 0, conn,
+    fetch_data = matrix_api_start(url->str, "POST", "", "{}", NULL, 0, conn,
             callback, error_callback, bad_response_callback, user_data, 0);
     g_string_free(url, TRUE);
 
