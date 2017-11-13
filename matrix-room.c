@@ -34,6 +34,8 @@
 #include "matrix-roommembers.h"
 #include "matrix-statetable.h"
 
+#include <gcrypt.h>
+
 
 static gchar *_get_room_name(MatrixConnectionData *conn,
         PurpleConversation *conv);
@@ -633,11 +635,67 @@ struct ReceiveImageData {
     struct MatrixMediaCryptInfo decrypt;
 };
 
+/* Deal with encrypted image data */
+static void _image_download_complete_crypt(struct ReceiveImageData *rid,
+        const char *raw_body, size_t raw_body_len)
+{
+    char *fail_str = NULL;
+    gcry_error_t gcry_err;
+    gcry_cipher_hd_t cipher_hd;
+
+    gcry_err = gcry_cipher_open(&cipher_hd, GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_CTR, 0);
+    if (gcry_err) {
+        fail_str = "failed to open cipher";
+        goto err;
+    }
+    gcry_err = gcry_cipher_setkey(cipher_hd, rid->decrypt.aes_k, 32);
+    if (gcry_err) {
+        fail_str = "failed to set key";
+        goto err;
+    }
+    /* Note: this is only working if we use setctr not setiv */
+    gcry_err = gcry_cipher_setctr(cipher_hd, rid->decrypt.aes_iv, 16);
+    if (gcry_err) {
+        fail_str = "failed to set iv";
+        goto err;
+    }
+    char *decrypted = g_malloc(raw_body_len); /* Do I need to round this to block len? */
+    gcry_cipher_final(cipher_hd);
+    gcry_err = gcry_cipher_decrypt(cipher_hd, decrypted, raw_body_len,
+                                   raw_body, raw_body_len);
+    if (gcry_err) {
+        g_free(decrypted);
+        fail_str = "failed to decrypt";
+        goto err;
+    }
+
+    gcry_cipher_close(cipher_hd);
+    /* TODO: Check sha */
+    int img_id = purple_imgstore_add_with_id(decrypted, raw_body_len, NULL);
+    serv_got_chat_in(rid->conv->account->gc, g_str_hash(rid->room_id), rid->sender_display_name,
+            PURPLE_MESSAGE_RECV | PURPLE_MESSAGE_IMAGES,
+            g_strdup_printf("<IMG ID=\"%d\">", img_id), rid->timestamp / 1000);
+
+err:
+    if (fail_str) {
+        serv_got_chat_in(rid->conv->account->gc, g_str_hash(rid->room_id),
+                rid->sender_display_name, PURPLE_MESSAGE_RECV,
+                g_strdup_printf("%s (%s)",
+                        rid->original_body, fail_str), rid->timestamp / 1000);
+    }
+
+    g_free(rid->original_body);
+    g_free(rid);
+}
+
 static void _image_download_complete(MatrixConnectionData *ma,
           gpointer user_data, JsonNode *json_root,
           const char *raw_body, size_t raw_body_len, const char *content_type)
 {
     struct ReceiveImageData *rid = user_data;
+    if (rid->decrypt.encrypted) {
+        return _image_download_complete_crypt(rid, raw_body, raw_body_len);
+    }
     if (is_known_image_type(content_type)) {
         /* Excellent - something to work with */
         int img_id = purple_imgstore_add_with_id(g_memdup(raw_body, raw_body_len),
