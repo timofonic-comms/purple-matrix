@@ -617,12 +617,20 @@ static void _send_image_hook(MatrixRoomEvent *event, gboolean just_free)
 /* Passed through matrix_api_download_file all the way
  * downto _image_download_complete
  */
+struct MatrixMediaCryptInfo {
+    gboolean encrypted;
+    guchar sha256[32];
+    guchar aes_k[32];
+    guchar aes_iv[16];
+};
+
 struct ReceiveImageData {
     PurpleConversation *conv;
     gint64 timestamp;
     const gchar *room_id;
     const gchar *sender_display_name;
     gchar *original_body;
+    struct MatrixMediaCryptInfo decrypt;
 };
 
 static void _image_download_complete(MatrixConnectionData *ma,
@@ -682,6 +690,105 @@ static void _image_download_error(MatrixConnectionData *ma, gpointer user_data,
     g_free(rid);
 }
 
+/* Fixup an incoming web signature string to standard base64
+ */
+static void _jws_tobase64(gchar *out, const gchar *in)
+{
+    unsigned int i;
+    for (i=0;in[i];i++) {
+        out[i] = in[i];
+        switch (in[i]) {
+            case '-':
+                out[i] = '+';
+                break;
+
+            case '_':
+                out[i] = '/';
+                break;
+
+            default:
+                break;
+        }
+    }
+    while (i & 3) {
+        out[i] = '=';
+        i++;
+    }
+    out[i] = '\0';
+    purple_debug_info("matrixprpl", "%s: in: %s out: %s\n",
+            __func__, in, out);
+}
+
+static gboolean _get_media_decrypt_info(struct MatrixMediaCryptInfo *ci,
+                                        JsonObject *file_obj)
+{
+    const gchar *v_str = matrix_json_object_get_string_member(file_obj, "v");
+    const gchar *iv_str = matrix_json_object_get_string_member(file_obj, "iv");
+    /* RFC7517 JSON Web Key */
+    JsonObject *key_obj = matrix_json_object_get_object_member(file_obj,
+                                                               "key");
+    JsonObject *hashes_obj = matrix_json_object_get_object_member(file_obj,
+                                                               "hashes");
+    const gchar *alg_str = matrix_json_object_get_string_member(key_obj, "alg");
+    const gchar *kty_str = matrix_json_object_get_string_member(key_obj, "kty");
+    const gchar *k_str = matrix_json_object_get_string_member(key_obj, "k");
+    const gchar *sha256_str = matrix_json_object_get_string_member(hashes_obj,
+                                                                   "sha256");
+    if (!v_str || strcmp(v_str, "v2")) {
+        purple_debug_info("matrixprpl", "bad media decrypt version\n");
+        return FALSE;
+    }
+    if (!iv_str || !alg_str || !kty_str || !k_str || !sha256_str) {
+        purple_debug_info("matrixprpl", "missing media decrypt field\n");
+        return FALSE;
+    }
+    if (strcmp(alg_str, "A256CTR") || strcmp(kty_str, "oct")) {
+        purple_debug_info("matrixprpl", "media decrypt: bad alg/kty :%s/%s\n",
+                alg_str, kty_str);
+        return FALSE;
+    }
+    if (strlen(iv_str) != 22 || strlen(sha256_str) != 43 ||
+        strlen(k_str) != 43) {
+        purple_debug_info("matrixprpl", "media decrypt: Bad key/sha len:"
+                " iv: %s sha256: %s k: %s\n", iv_str, sha256_str, k_str);
+        return FALSE;
+    }
+
+    /* The k_str isn't a simple base64, it's needs _ -> / and - -> +
+     * as https://tools.ietf.org/html/draft-ietf-jose-json-web-signature-41#appendix-C
+     * The other two are normal encoding but need =/== padding
+     */
+    gchar tmp_str[48];
+    gsize k_len, iv_len, sha256_len;
+    _jws_tobase64(tmp_str, k_str);
+    guchar *decoded_k = g_base64_decode(tmp_str, &k_len);
+    _jws_tobase64(tmp_str, iv_str);
+    guchar *decoded_iv = g_base64_decode(tmp_str, &iv_len);
+    _jws_tobase64(tmp_str, sha256_str);
+    guchar *decoded_sha256 = g_base64_decode(tmp_str, &sha256_len);
+    
+    if (k_len != 32 || iv_len != 16 || sha256_len != 32) {
+        purple_debug_info("matrixprpl", "media decrypt: Bad base64 decode:"
+                " iv: %s=%zd sha256: %s=%zd k: %s=%zd\n",
+                iv_str, iv_len, sha256_str, sha256_len,  k_str, k_len);
+        g_free(decoded_k);
+        g_free(decoded_iv);
+        g_free(decoded_sha256);
+        return FALSE;
+    }
+    purple_debug_info("matrixprpl", "media decrypt: got decrypt keys\n");
+
+    ci->encrypted = TRUE;
+    memcpy(ci->sha256, decoded_sha256, 32);
+    memcpy(ci->aes_k, decoded_k, 32);
+    memcpy(ci->aes_iv, decoded_iv, 16);
+
+    g_free(decoded_k);
+    g_free(decoded_iv);
+    g_free(decoded_sha256);
+
+    return TRUE;
+}
 
 /*
  * Called from matrix_room_handle_timeline_event when it finds an m.image;
@@ -701,13 +808,24 @@ static gboolean _handle_incoming_image(PurpleConversation *conv,
     gboolean use_thumb = FALSE;
 
     const gchar *url;
+    JsonObject *json_file_obj = NULL;
+    JsonObject *json_thumb_obj = NULL;
     JsonObject *json_info_object;
 
     url = matrix_json_object_get_string_member(json_content_object, "url");
     if (!url) {
-        /* That seems odd, oh well, no point in getting upset */
-        purple_debug_info("matrixprpl", "failed to get url for m.image");
-        return FALSE;
+        /* Could be a new style format used by the e2e world */
+        json_file_obj = matrix_json_object_get_object_member(
+                json_content_object, "file");
+        if (json_file_obj) {
+            url = matrix_json_object_get_string_member(json_file_obj,
+                    "url");
+        }
+        if (!url) {
+            /* That seems odd, oh well, no point in getting upset */
+            purple_debug_info("matrixprpl", "failed to get url for m.image");
+            return FALSE;
+        }
     }
 
     /* the 'info' member is optional but if we've got it we can check it to early
@@ -745,6 +863,39 @@ static gboolean _handle_incoming_image(PurpleConversation *conv,
     rid->sender_display_name = sender_display_name;
     rid->room_id = room_id;
     rid->original_body = g_strdup(msg_body);
+    rid->decrypt.encrypted = FALSE;
+
+    /* In the world with file members, we've also got a thumnail_file
+     * member with potentially quite different data.
+     */
+    if (use_thumb && json_file_obj) {
+        json_thumb_obj =  matrix_json_object_get_object_member(
+                json_content_object, "thumbnail_file");
+        if (json_thumb_obj) {
+            const char *thumb_url;
+            thumb_url = matrix_json_object_get_string_member(json_thumb_obj,
+                    "url");
+            if (thumb_url) {
+                url = thumb_url;
+                if (!_get_media_decrypt_info(&rid->decrypt,
+                                                json_thumb_obj)) {
+                    return FALSE;
+                }
+            }
+        }
+        /* If the above worked we're going to fetch the thumb using the
+         * normal fetch mechanism, not the thumb API, so turn it off.
+         * If the above failed but have the file object we can't
+         * fetch the thumb anyway, so use the main image and hope it fits.
+         */
+        use_thumb = FALSE;
+    }
+    if (json_file_obj && !rid->decrypt.encrypted) {
+        /* No thumb, we're decrypting the main file */
+        if (!_get_media_decrypt_info(&rid->decrypt, json_file_obj)) {
+            return FALSE;
+        }
+    }
 
     if (!use_thumb) {
             fetch_data = matrix_api_download_file(conn, url,
